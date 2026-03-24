@@ -7,15 +7,15 @@
 set -Eeuo pipefail
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
-YW=$(echo "\033[33m")
-GN=$(echo "\033[1;92m")
-RD=$(echo "\033[01;31m")
-BL=$(echo "\033[36m")
-CM='\xE2\x9C\x94\033[0m'
-CROSS='\xE2\x9C\x97\033[0m'
-BFR="\\r\\033[K"
+YW=$'\033[33m'
+GN=$'\033[1;92m'
+RD=$'\033[01;31m'
+BL=$'\033[36m'
+CM=$'\xE2\x9C\x94\033[0m'
+CROSS=$'\xE2\x9C\x97\033[0m'
+BFR=$'\r\033[K'
 HOLD="-"
-CL=$(echo "\033[m")
+CL=$'\033[m'
 
 msg_info()  { local msg="$1"; echo -ne " ${HOLD} ${YW}${msg}...${CL}"; }
 msg_ok()    { local msg="$1"; echo -e "${BFR} ${CM} ${GN}${msg}${CL}"; }
@@ -26,47 +26,33 @@ die() { msg_error "$1"; exit 1; }
 # ── Must run as root ──────────────────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || die "This script must be run as root."
 
-# ── Resolve latest GoPhish release ───────────────────────────────────────────
+# ── Resolve latest GoPhish release (redirect — no API rate limits) ────────────
 msg_info "Fetching latest GoPhish release"
-LATEST_JSON=$(curl -fsSL "https://api.github.com/repos/gophish/gophish/releases/latest") \
-  || die "Failed to query GitHub API."
 
-GOPHISH_VERSION=$(echo "$LATEST_JSON" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-[[ -n "$GOPHISH_VERSION" ]] || die "Could not determine latest GoPhish version."
+GOPHISH_VERSION=$(curl -fsSL -o /dev/null -w "%{url_effective}" \
+  "https://github.com/gophish/gophish/releases/latest" \
+  | grep -oP 'v[\d.]+$') \
+  || die "Failed to resolve latest GoPhish version."
+[[ -n "$GOPHISH_VERSION" ]] || die "Could not parse GoPhish version from redirect URL."
 
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64)  ARCH_LABEL="linux-amd64" ;;
-  aarch64) ARCH_LABEL="linux-arm64" ;;
-  *)       die "Unsupported architecture: $ARCH" ;;
-esac
-
-DOWNLOAD_URL=$(echo "$LATEST_JSON" \
-  | grep '"browser_download_url"' \
-  | grep "${ARCH_LABEL}" \
-  | grep '\.zip"' \
-  | head -1 \
-  | cut -d'"' -f4)
-[[ -n "$DOWNLOAD_URL" ]] || die "Could not find a download URL for ${ARCH_LABEL}."
-
-msg_ok "Found GoPhish ${GOPHISH_VERSION} (${ARCH_LABEL})"
+# GoPhish only ships linux-64bit; no ARM64 binary available upstream
+DOWNLOAD_URL="https://github.com/gophish/gophish/releases/download/${GOPHISH_VERSION}/gophish-${GOPHISH_VERSION}-linux-64bit.zip"
+msg_ok "Found GoPhish ${GOPHISH_VERSION}"
 
 # ── System dependencies ───────────────────────────────────────────────────────
 msg_info "Updating system packages"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq &>/dev/null
-apt-get upgrade -y -qq &>/dev/null
+apt-get update -qq >/dev/null 2>&1
+apt-get upgrade -y -qq >/dev/null 2>&1
 msg_ok "System updated"
 
 msg_info "Installing dependencies"
-apt-get install -y -qq \
-  curl wget unzip ca-certificates \
-  &>/dev/null
+apt-get install -y -qq curl wget unzip ca-certificates libcap2-bin >/dev/null 2>&1
 msg_ok "Dependencies installed"
 
 # ── Create dedicated service user ─────────────────────────────────────────────
 msg_info "Creating gophish system user"
-if ! id -u gophish &>/dev/null; then
+if ! id -u gophish >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin gophish
 fi
 msg_ok "User created"
@@ -74,10 +60,11 @@ msg_ok "User created"
 # ── Download & install GoPhish ────────────────────────────────────────────────
 INSTALL_DIR="/opt/gophish"
 TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
 
 msg_info "Downloading GoPhish ${GOPHISH_VERSION}"
 wget -qO "${TMP_DIR}/gophish.zip" "$DOWNLOAD_URL" \
-  || die "Failed to download GoPhish."
+  || die "Failed to download GoPhish from ${DOWNLOAD_URL}."
 msg_ok "Downloaded GoPhish"
 
 msg_info "Installing GoPhish to ${INSTALL_DIR}"
@@ -85,18 +72,18 @@ mkdir -p "$INSTALL_DIR"
 unzip -oq "${TMP_DIR}/gophish.zip" -d "${TMP_DIR}/extracted"
 cp -r "${TMP_DIR}/extracted/." "${INSTALL_DIR}/"
 chmod +x "${INSTALL_DIR}/gophish"
+# Grant port 80/443 binding without running as root
+setcap cap_net_bind_service=+ep "${INSTALL_DIR}/gophish"
 chown -R gophish:gophish "${INSTALL_DIR}"
-rm -rf "$TMP_DIR"
 msg_ok "GoPhish installed"
 
 # ── Configure GoPhish ─────────────────────────────────────────────────────────
 msg_info "Writing configuration"
 
-# Backup original if present
 [[ -f "${INSTALL_DIR}/config.json" ]] \
   && cp "${INSTALL_DIR}/config.json" "${INSTALL_DIR}/config.json.bak"
 
-cat > "${INSTALL_DIR}/config.json" <<'EOF'
+cat > "${INSTALL_DIR}/config.json" <<'EOCFG'
 {
   "admin_server": {
     "listen_url": "0.0.0.0:3333",
@@ -119,14 +106,14 @@ cat > "${INSTALL_DIR}/config.json" <<'EOF'
     "level": ""
   }
 }
-EOF
+EOCFG
 
 chown gophish:gophish "${INSTALL_DIR}/config.json"
 msg_ok "Configuration written"
 
 # ── Systemd service ───────────────────────────────────────────────────────────
 msg_info "Creating systemd service"
-cat > /etc/systemd/system/gophish.service <<EOF
+cat > /etc/systemd/system/gophish.service <<EOSERVICE
 [Unit]
 Description=GoPhish Phishing Framework
 Documentation=https://getgophish.com/documentation/
@@ -141,41 +128,45 @@ WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/gophish
 Restart=on-failure
 RestartSec=5
-# Harden the service
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOSERVICE
+msg_ok "Systemd service file written"
 
-systemctl daemon-reload &>/dev/null
-systemctl enable --now gophish &>/dev/null
-msg_ok "Systemd service enabled and started"
-
-# ── Firewall (ufw) — optional ─────────────────────────────────────────────────
-if command -v ufw &>/dev/null; then
-  msg_info "Configuring UFW firewall rules"
-  ufw allow 3333/tcp comment "GoPhish admin" &>/dev/null
-  ufw allow 80/tcp   comment "GoPhish phishing (HTTP)" &>/dev/null
-  ufw allow 443/tcp  comment "GoPhish phishing (HTTPS)" &>/dev/null
-  msg_ok "UFW rules added"
+# Detect whether systemd is the running init (PID 1)
+SYSTEMD_ACTIVE=false
+if [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ]; then
+  SYSTEMD_ACTIVE=true
 fi
 
-# ── Fetch initial admin password from logs ────────────────────────────────────
-msg_info "Waiting for GoPhish to start and generate credentials"
-sleep 5
-INITIAL_PW=""
-for i in {1..10}; do
-  INITIAL_PW=$(journalctl -u gophish --no-pager -n 50 2>/dev/null \
-    | grep -oP '(?<=Please login with the username admin and the password )[^\s]+' \
-    | head -1 || true)
-  [[ -n "$INITIAL_PW" ]] && break
-  sleep 3
-done
-msg_ok "GoPhish started"
+if $SYSTEMD_ACTIVE; then
+  msg_info "Enabling and starting GoPhish service"
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable gophish >/dev/null 2>&1
+  if systemctl start gophish >/dev/null 2>&1; then
+    msg_ok "GoPhish service started"
+  else
+    msg_error "Service failed to start — check: journalctl -u gophish"
+    systemctl status gophish --no-pager 2>/dev/null || true
+    exit 1
+  fi
+
+  # ── Fetch initial admin password from service logs ──────────────────────────
+  msg_info "Waiting for GoPhish to generate credentials"
+  INITIAL_PW=""
+  for _ in {1..12}; do
+    INITIAL_PW=$(journalctl -u gophish --no-pager -n 50 2>/dev/null \
+      | grep -oP '(?<=Please login with the username admin and the password )[^\s]+' \
+      | head -1 || true)
+    [[ -n "$INITIAL_PW" ]] && break
+    sleep 3
+  done
+  msg_ok "GoPhish is running"
+else
+  msg_ok "Service file written (systemd not active — start manually or reboot)"
+  INITIAL_PW="<run: journalctl -u gophish | grep password>"
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
@@ -186,7 +177,7 @@ ${GN}─────────────────────────
   Admin UI   : ${BL}https://${IP}:3333${CL}
   Phish HTTP : ${BL}http://${IP}:80${CL}
   Username   : ${YW}admin${CL}
-  Password   : ${YW}${INITIAL_PW:-<see: journalctl -u gophish>}${CL}
+  Password   : ${YW}${INITIAL_PW:-<run: journalctl -u gophish | grep password>}${CL}
   Install dir: ${INSTALL_DIR}
 
   IMPORTANT: You will be forced to change the password
