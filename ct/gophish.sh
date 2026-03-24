@@ -226,12 +226,15 @@ msg_ok "Container started"
 
 msg_info "Installing ${APP} (this may take a few minutes)"
 
-SCRIPT_URL="https://raw.githubusercontent.com/erk91495/proxmox-scripts/main/install/${var_install}.sh"
+REPO_BRANCH="${GOPHISH_BRANCH:-main}"
+SCRIPT_URL="https://raw.githubusercontent.com/erk91495/proxmox-scripts/${REPO_BRANCH}/install/${var_install}.sh"
 
 pct exec "$CT_ID" -- /bin/bash -c "
-  apt-get update -qq &>/dev/null
-  apt-get install -y curl wget &>/dev/null
-  bash <(curl -fsSL '${SCRIPT_URL}')
+  apt-get update -qq >/dev/null 2>&1
+  apt-get install -y curl >/dev/null 2>&1
+  curl -fsSL '${SCRIPT_URL}' -o /tmp/${var_install}.sh \
+    || { echo 'ERROR: could not fetch ${SCRIPT_URL}'; exit 1; }
+  bash /tmp/${var_install}.sh
 " || die "Installation script failed."
 
 msg_ok "${APP} installed"
